@@ -41,14 +41,18 @@ def rotate(img, deg):
     return np.ascontiguousarray(np.rot90(img, k)) if k else img
 
 
-def decode(mp4_bytes):
-    """Yield (t_rel, bgr). Raises DecodeError (after yielding what decoded) on failure."""
+def decode(mp4_bytes, keep=None, threads=0):
+    """Yield (t_rel, bgr). Raises DecodeError (after yielding what decoded) on failure.
+    keep(t_rel)->bool: if given, frames it rejects are yielded as (t_rel, None) without conversion.
+    threads: codec thread_count (0 = auto)."""
     try:
         if not mp4_bytes:
             raise ValueError("empty video")
         c = av.open(io.BytesIO(mp4_bytes))
         s = c.streams.video[0]
         s.thread_type = "AUTO"
+        if threads:
+            s.codec_context.thread_count = threads
         rate = float(s.average_rate or s.guessed_rate or 25)
     except Exception as e:
         raise DecodeError(f"could not open video: {str(e)[:100]}") from e
@@ -58,8 +62,12 @@ def decode(mp4_bytes):
             t = f.time if f.pts is not None else i / rate
             if t0 is None:
                 t0, rot = t, get_rotation(s, f)
+            tr = max(0.0, t - t0)
+            if keep is not None and not keep(tr):
+                yield tr, None
+                continue
             img = f.to_ndarray(format="bgr24")
-            yield max(0.0, t - t0), (rotate(img, rot) if rot else img)
+            yield tr, (rotate(img, rot) if rot else img)
     except Exception as e:
         raise DecodeError(f"decode failed: {str(e)[:100]}") from e
     finally:

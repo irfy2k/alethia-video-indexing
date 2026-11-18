@@ -56,6 +56,14 @@ Order = expected win size. Keep a flag/constant for each so we can A/B.
    accuracy; TRT engine shape choice follows from that.
 5. Output: write lines as each video finishes; flush; order irrelevant.
 
+## Streamlined scope (decided 2026-11-18, user wants minimum time/compute)
+
+- TensorRT dropped: PyTorch FP16 + frame sampling + parallel decode only. No `tensorrt` in requirements.
+- Reference: only the train-00000 videos finished by tonight; no top-up runs.
+- One Opus review pass on the final run.py (not per commit).
+- Kaggle notebook does a 1-file smoke check and the 50-file run in ONE session (one click for the user).
+- Docs drafted by Haiku in parallel with the review.
+
 ## Phase C — packaging (Haiku)
 
 `requirements.txt` with exact versions (torch from the cu126 index via `--extra-index-url`; grader
