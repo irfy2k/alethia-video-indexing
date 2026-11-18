@@ -1,0 +1,10 @@
+finevideo/
+*.pt
+*.engine
+*.onnx
+.venv/
+__pycache__/
+results.jsonl
+ref/
+*.log
+docs/brief.pdf
