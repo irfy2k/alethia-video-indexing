@@ -4,9 +4,9 @@ All numbers come from docs/NOTES.md and the Kaggle run.
 
 ## 1. Your timings
 
-My first working version was tools/ref.py: every frame, FP32 ultralytics predict. I did not run it on all 50 files. It ran at 57 frames/s on my laptop, and the 50 files hold about 13.5 million frames, so I estimate about 66 hours. That is an extrapolation, not a measurement.
+My first working version was tools/ref.py: every frame, FP32 ultralytics predict. I did not run it on all 50 files. At 57 frames/s on my laptop, the 50 files' 13.5 million frames would take about 66 hours (an extrapolation).
 
-The final version ran all 50 files on Kaggle (2x T4) in `__KAGGLE_TIME__`.
+The final version ran all 50 files on Kaggle (2x T4) in 8,920 s (2.48 h). See HARDWARE.md.
 
 The change that saved the most time was frame sampling: K=4 frames per second. On my 14 test videos it decoded 108,538 frames and ran the model on 15,362, about 1 in 7.
 
@@ -18,11 +18,11 @@ The main process groups frames of the same shape into batches. An inference thre
 
 ## 3. Where the time goes
 
-I measured with an instrumented copy of run.py with a timer per stage, nvidia-smi sampling of GPU utilisation, and isolated micro-benchmarks of each stage.
+I measured with per-stage timers in a copy of run.py, nvidia-smi sampling, and stage micro-benchmarks.
 
 The profile, taken before the NMS change, showed the inference thread spending 89 s in the forward pass, 49 s in NMS and 3 s pinning memory. The main thread waited 84 s on a full inference queue. Mean GPU utilisation was 38%. Decode was not the limit: 1,780 frames/s per core, and the forward pass runs at 230 img/s at batch 64.
 
-The NMS was ultralytics' per-image Python loop. I replaced it with one batched NMS on person boxes. The 14-video run went from 158 s to 106 s. The GPU forward pass is now the main cost.
+I replaced ultralytics' per-image NMS loop with one batched NMS on person boxes. The forward pass is now the main cost.
 
 | Version (14 videos, K=4) | Wall |
 |---|---|
