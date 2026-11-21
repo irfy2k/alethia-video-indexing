@@ -81,15 +81,37 @@ def load_model(path):
     return m
 
 
-def infer(model, arr):
-    """arr: stacked uint8 NHWC BGR -> list of class-id lists."""
+def postprocess(pred, conf=0.4, iou=0.7):
+    """Batched equivalent of ultralytics non_max_suppression(conf, iou, classes=CLASS_IDS) for what we
+    need: per image, which of our classes survive and how many people survive NMS. A class is present iff
+    some box has it as argmax class with score > conf (class-aware NMS always keeps that class's top box),
+    so only person boxes need NMS. One batched_nms call per batch instead of a Python loop per image
+    (that loop was ~35% of inference-thread time and has a wall-clock time limit that silently drops images).
+    ponytail: ignores ultralytics' max_det=300 cap, only matters with >300 detections in one frame."""
     import torch
-    from ultralytics.utils.nms import non_max_suppression
+    from torchvision.ops import batched_nms
+    p = pred.float().transpose(1, 2)  # (B, anchors, 4 + 80)
+    score, cls = p[..., 4:].max(-1)
+    ok = score > conf
+    present = torch.stack([(ok & (cls == c)).any(1) for c in CLASS_IDS], 1)  # (B, 5)
+    b, a = (ok & (cls == 0)).nonzero(as_tuple=True)
+    xywh = p[b, a, :4]
+    boxes = torch.cat((xywh[:, :2] - xywh[:, 2:] / 2, xywh[:, :2] + xywh[:, 2:] / 2), 1)
+    keep = batched_nms(boxes, score[b, a], b, iou)
+    people = torch.bincount(b[keep], minlength=len(p))
+    present, people = present.cpu().tolist(), people.cpu().tolist()
+    ids = list(CLASS_IDS)
+    return [[0] * n + [c for c, on in zip(ids[1:], pr[1:]) if on] for pr, n in zip(present, people)]
+
+
+def infer(model, arr):
+    """arr: stacked uint8 NHWC BGR -> list of class-id lists (one entry per person, one per other class)."""
+    import torch
     with torch.inference_mode():
         x = torch.from_numpy(arr).pin_memory().cuda(non_blocking=True).permute(0, 3, 1, 2).contiguous().flip(1)
         x = x.half().div_(255)  # same as ultralytics preprocess with fp16
-        out = non_max_suppression(model(x), 0.4, 0.7, classes=list(CLASS_IDS))
-        return [o[:, 5].int().tolist() for o in out]
+        y = model(x)
+        return postprocess(y[0] if isinstance(y, (list, tuple)) else y)
 
 
 def main():
