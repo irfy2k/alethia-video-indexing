@@ -17,6 +17,9 @@ videos from train-00000 (3,846 s of video, 108,538 frames).
 | 6 | 0.986 | 95.8% | 99.7% | 317 s |
 K=3 on the first 3 videos only cleared F1 by 0.004 (crowd scene), so K=4 was chosen.
 
+At K=4 the 14-video run decodes 108,538 frames and runs the model on 15,362 (1 in 7.07).
+Batched person-only NMS was checked against ultralytics non_max_suppression on 1,693 real frames: 0 differ.
+
 ## Bugs caught by the reference comparison
 - 640x640 square letterbox vs the reference's rect letterbox (640x384): people exact 89.8% -> fixed, K=1000
   then matched the reference exactly (F1 1.0, exact 100%).
