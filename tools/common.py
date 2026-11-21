@@ -8,20 +8,40 @@ CLASS_IDS = {0: "person", 2: "car", 16: "dog", 63: "laptop", 67: "cell phone"}
 
 def iter_videos(input_dir, only=None):
     """Yield (video_id, mp4_bytes); id = '<parquet basename>:<row>'.
-    Reads one row group at a time, mp4 column only. `only` = optional set of ids to keep."""
+    Reads one row group at a time, mp4 column only. `only` = optional set of ids to keep.
+    Unreadable file / row group / cell -> (id, None) so the caller writes an error line."""
     import pyarrow.parquet as pq
     for path in sorted(glob.glob(os.path.join(input_dir, "*.parquet"))):
         name = os.path.basename(path)
-        pf = pq.ParquetFile(path)
+        try:
+            pf = pq.ParquetFile(path)
+            groups = pf.num_row_groups
+            has_mp4 = "mp4" in pf.schema_arrow.names
+        except Exception:  # row count unknown: one placeholder row
+            if only is None or any(v.startswith(name + ":") for v in only):
+                yield f"{name}:0", None
+            continue
         start = 0
-        for g in range(pf.num_row_groups):
-            n = pf.metadata.row_group(g).num_rows
+        for g in range(groups):
+            try:
+                n = pf.metadata.row_group(g).num_rows
+            except Exception:
+                yield f"{name}:{start}", None
+                break  # later row offsets unknown
             want = [i for i in range(n) if only is None or f"{name}:{start + i}" in only]
-            if want:
-                col = pf.read_row_group(g, columns=["mp4"]).column(0)
-                for i in want:
-                    yield f"{name}:{start + i}", col[i].as_py()
-                del col
+            col = None
+            if want and has_mp4:
+                try:
+                    col = pf.read_row_group(g, columns=["mp4"]).column(0)
+                except Exception:
+                    col = None
+            for i in want:
+                try:
+                    v = col[i].as_py() if col is not None else None
+                except Exception:
+                    v = None
+                yield f"{name}:{start + i}", v
+            del col
             start += n
 
 

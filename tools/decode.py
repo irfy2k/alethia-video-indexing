@@ -11,8 +11,8 @@ class DecodeError(Exception):
 
 
 def get_rotation(stream, frame=None):
-    """Display rotation in degrees, COUNTERCLOCKWISE (ffmpeg av_display_rotation_get convention:
-    a phone video tagged 'rotate 90' reports -90, i.e. rotate 90 deg clockwise to display)."""
+    """Display rotation in degrees, COUNTERCLOCKWISE (PyAV frame.rotation: rotate the frame this many
+    degrees counterclockwise to display it upright; a 'rotate 90' phone video reports 90)."""
     rot = getattr(frame, "rotation", None) if frame is not None else None
     if rot is not None:
         return rot
@@ -58,17 +58,40 @@ def decode(mp4_bytes, keep=None, threads=0):
         raise DecodeError(f"could not open video: {str(e)[:100]}") from e
     try:
         t0, rot = None, None
-        for i, f in enumerate(c.decode(s)):
+        for i, f in enumerate(_frames(c, s)):
             t = f.time if f.pts is not None else i / rate
             if t0 is None:
                 t0, rot = t, get_rotation(s, f)
             tr = max(0.0, t - t0)
+            if tr > 2 * (i + 1) / rate + 60:
+                raise DecodeError("garbage timestamps")
             if keep is not None and not keep(tr):
                 yield tr, None
                 continue
             img = f.to_ndarray(format="bgr24")
             yield tr, (rotate(img, rot) if rot else img)
+    except DecodeError:
+        raise
     except Exception as e:
         raise DecodeError(f"decode failed: {str(e)[:100]}") from e
     finally:
         c.close()
+
+
+def _frames(c, s, max_bad=50):
+    """Decoded frames; a packet that fails to decode is skipped (DecodeError after max_bad)."""
+    bad = 0
+
+    def dec(pkt):
+        nonlocal bad
+        try:
+            return list(s.decode(pkt))
+        except av.error.FFmpegError:
+            bad += 1
+            if bad > max_bad:
+                raise DecodeError(f"too many bad packets ({bad})")
+            return []
+
+    for pkt in c.demux(s):
+        yield from dec(pkt)
+    yield from dec(None)  # flush

@@ -65,6 +65,8 @@ def worker(tasks, results, k, threads):
                         buf = []
         except Exception as e:
             err = str(e)[:200] or type(e).__name__
+        if n == 0 and not err:
+            err = "no frames decoded"
         if buf:
             results.put(("f", vid, buf))
         results.put(("d", vid, last, n, err))
@@ -79,12 +81,12 @@ def load_model(path):
     return m
 
 
-def infer(model, arrs):
-    """arrs: list of same-shape uint8 HWC BGR -> list of class-id lists."""
+def infer(model, arr):
+    """arr: stacked uint8 NHWC BGR -> list of class-id lists."""
     import torch
     from ultralytics.utils.nms import non_max_suppression
     with torch.inference_mode():
-        x = torch.from_numpy(np.stack(arrs)).cuda().permute(0, 3, 1, 2).contiguous().flip(1)
+        x = torch.from_numpy(arr).pin_memory().cuda(non_blocking=True).permute(0, 3, 1, 2).contiguous().flip(1)
         x = x.half().div_(255)  # same as ultralytics preprocess with fp16
         out = non_max_suppression(model(x), 0.4, 0.7, classes=list(CLASS_IDS))
         return [o[:, 5].int().tolist() for o in out]
@@ -94,7 +96,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--k", type=int, default=3)
+    ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 3) - 2))
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--threads", type=int, default=1, help="codec threads per worker")
@@ -106,6 +108,7 @@ def main():
 
     ctx = mp.get_context("spawn")
     tasks = ctx.Queue(maxsize=a.workers * 2)
+    tasks.cancel_join_thread()  # never block exit on the feeder thread
     results = ctx.Queue(maxsize=48)  # <= 48*CHUNK frames in flight (~1 GB)
     procs = [ctx.Process(target=worker, args=(tasks, results, a.k, a.threads), daemon=True)
              for _ in range(a.workers)]
@@ -126,7 +129,7 @@ def main():
 
     threading.Thread(target=reader, daemon=True).start()
     model = load_model(a.model)
-    infer(model, [np.zeros((IMGSZ, IMGSZ, 3), np.uint8)])  # warmup
+    infer(model, np.zeros((1, IMGSZ, IMGSZ, 3), np.uint8))  # warmup
 
     out = open(a.output, "w")
     states, bufs = {}, {}  # vid -> state; shape -> [(vid, sec, arr)]
@@ -154,12 +157,27 @@ def main():
         if st["done"] and st["inf"] == st["recv"]:
             finalize(vid)
 
-    def run_batch(items):
-        try:
-            ids = infer(model, [x[2] for x in items])
+    todo, done = queue.Queue(maxsize=2), queue.Queue()  # ready batches -> inference thread -> results
+    sent = got = 0
+
+    def infer_loop():
+        while True:
+            job = todo.get()
+            if job is None:
+                return
+            items, arr = job
+            try:
+                done.put((items, infer(model, arr), None))
+            except Exception as e:
+                done.put((items, None, e))
+
+    threading.Thread(target=infer_loop, daemon=True).start()
+
+    def handle(items, ids, e):  # main thread only: all state lives here
+        if e is None:
             for (vid, sec, _), i in zip(items, ids):
                 states[vid]["res"].append((sec, i))
-        except Exception as e:
+        else:
             for vid, sec, _ in items:
                 st = states[vid]
                 st["fail"] = min(st["fail"], sec)
@@ -172,25 +190,46 @@ def main():
             states[vid]["inf"] += c
             check(vid)
 
+    def drain(block=False):
+        nonlocal got
+        while got < sent:
+            try:
+                handle(*done.get(timeout=1) if block else done.get_nowait())
+            except queue.Empty:
+                if not block:
+                    return
+                continue
+            got += 1
+
     def flush(force):
+        nonlocal sent
         for shape in list(bufs):
             b = bufs[shape]
             while len(b) >= a.batch or (force and b):
-                run_batch(b[:a.batch])
+                items = b[:a.batch]
                 del b[:a.batch]
+                todo.put((items, np.stack([x[2] for x in items])))
+                sent += 1
+                drain()
 
-    exits = 0
+    exits, last = 0, time.time()
     while exits < len(procs):
         try:
             msg = results.get(timeout=0.05)
         except queue.Empty:
             flush(True)  # GPU would idle otherwise
+            drain()
+            if time.time() - last > 300:  # hung worker: give up on the rest
+                for p in procs:
+                    p.terminate()
+                break
             if any(p.is_alive() for p in procs):
                 continue
             try:  # all workers gone: drain what is left, then stop
                 msg = results.get(timeout=1)
             except queue.Empty:
                 break
+        last = time.time()
         if msg[0] == "x":
             exits += 1
         elif msg[0] == "f":
@@ -199,23 +238,29 @@ def main():
             for sec, arr in frames:
                 bufs.setdefault(arr.shape, []).append((vid, sec, arr))
             flush(False)
+            drain()
         else:
-            _, vid, last, n, err = msg
+            _, vid, last_sec, n, err = msg
             st = state(vid)
             st.update(done=True, err=err)
             if err:
-                st["fail"] = min(st["fail"], last)
+                st["fail"] = min(st["fail"], last_sec)
             stats["decoded"] += n
             check(vid)
     flush(True)
-    for vid in list(states):  # worker died mid-video
-        states[vid]["done"] = True
-        states[vid]["err"] = states[vid]["err"] or "worker died"
+    drain(True)
+    todo.put(None)
+    for vid in list(states):  # worker died mid-video: last second may be partial
+        st = states[vid]
+        if st["res"]:
+            st["fail"] = min(st["fail"], max(s for s, _ in st["res"]))
+        st["done"] = True
+        st["err"] = st["err"] or "worker died"
         check(vid)
     for vid in sorted(pending):  # never reported
         emit({"video": vid, "error": "worker died"})
     for e in reader_errs:
-        emit({"video": a.input, "error": "input read failed: " + e})
+        emit({"video": "(input)", "error": "input read failed: " + e})
     out.close()
     for p in procs:
         p.join(timeout=5)
@@ -229,3 +274,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    sys.stderr.flush()
+    os._exit(0)  # never hang on CUDA/queue teardown
