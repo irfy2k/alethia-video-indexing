@@ -1,49 +1,47 @@
 # Write-up
 
-All numbers come from docs/NOTES.md and the Kaggle run.
-
 ## 1. Your timings
 
-My first working version was tools/ref.py: every frame, FP32 ultralytics predict. I did not run it on all 50 files. At 57 frames/s on my laptop, the 50 files' 13.5 million frames would take about 66 hours (an extrapolation).
+My first working version was tools/ref.py, which runs plain ultralytics predict on every frame in FP32. I never ran it on all 50 files. It managed 57 frames/s on my laptop, and the files hold about 13.5M frames, so that works out to roughly 66 hours (estimated, not measured).
 
-The final version ran all 50 files on Kaggle (2x T4) in 8,920 s (2.48 h). See HARDWARE.md.
+The final version did all 50 files on Kaggle (2x T4) in 8,920 s, about 2.5 hours. Details are in HARDWARE.md.
 
-The change that saved the most time was frame sampling: K=4 frames per second. On my 14 test videos it decoded 108,538 frames and ran the model on 15,362, about 1 in 7.
+The biggest win was sampling 4 frames per second instead of using every frame. On my 14 test videos that meant 15,362 frames through the model instead of 108,538.
 
 ## 2. Your pipeline
 
-A reader thread reads the mp4 column of each Parquet file, one row group at a time, and hands each video to spawned worker processes. Each worker decodes with PyAV. Timestamps are taken relative to the first decoded frame. I apply the stream rotation, then keep the first frame in each of K sub-intervals of every second. Each kept frame is letterboxed like ultralytics rect mode (for example 640x384).
+A reader thread goes through each Parquet file one row group at a time and passes the mp4 bytes to a pool of worker processes. Each worker decodes with PyAV and applies the rotation. It keeps the first frame in each quarter-second and letterboxes it the same way ultralytics does (640x360 becomes 640x384).
 
-The main process groups frames of the same shape into batches. An inference thread runs YOLO11l in FP16, then one batched NMS on person boxes only. For each second, an object counts if it appears in at least half of the sampled frames, and the people count is the median. The main process writes one JSON line per second. A damaged video gives an error line, and the seconds already finished are kept.
+Back in the main process, frames with the same shape are grouped into batches of 64. A separate thread runs YOLO11l in FP16 on the GPU, then does one batched NMS over the person boxes only. That's all I need, since the other classes only need a yes or no.
+
+For each second, an object counts if it shows up in at least half the sampled frames, and the people count is the median. If a video breaks partway through, I keep the seconds that finished and write an error line.
 
 ## 3. Where the time goes
 
-I measured with per-stage timers in a copy of run.py, nvidia-smi sampling, and stage micro-benchmarks.
+I timed each stage inside a copy of run.py, watched GPU usage with nvidia-smi, and benchmarked each stage on its own.
 
-The profile, taken before the NMS change, showed the inference thread spending 89 s in the forward pass, 49 s in NMS and 3 s pinning memory. The main thread waited 84 s on a full inference queue. Mean GPU utilisation was 38%. Decode was not the limit: 1,780 frames/s per core, and the forward pass runs at 230 img/s at batch 64.
+The first profile surprised me. The GPU was busy only 38% of the time. The inference thread spent 89 s in the forward pass, but also 49 s in NMS, because ultralytics runs NMS in a Python loop, one image at a time. Decoding wasn't the problem: one core decodes about 1,780 frames/s.
 
-I replaced ultralytics' per-image NMS loop with one batched NMS on person boxes. The forward pass is now the main cost.
+I replaced that loop with a single batched NMS on person boxes, and the 14-video run dropped from 158 s to 106 s. Now the forward pass is what's left.
 
-| Version (14 videos, K=4) | Wall |
+| Version (14 videos, K=4) | Wall time |
 |---|---|
-| Serial main loop | 193 s |
-| Inference in its own thread, pinned upload | 158 s |
+| Everything in one loop | 193 s |
+| Inference on its own thread, pinned memory | 158 s |
 | Batched person-only NMS | 106 s |
 
 ## 4. Checking correctness
 
-I built an every-frame reference (tools/ref.py) and tools/score.py, which computes the grader's metrics: object F1, people exact, people within 1. Running my pipeline with K=1000 reproduces the reference exactly (F1 1.0, exact 100%). That test caught a letterbox bug.
+Before speeding anything up I built a slow reference that runs every frame (tools/ref.py), plus tools/score.py, which computes the grader's three metrics. Running my pipeline on every frame (K=1000) should match the reference exactly. At first it didn't: I was letterboxing to 640x640 instead of 640x384. After fixing that it matched 100%.
 
-I re-scored every speed change on 14 videos. I checked that the batched NMS gives the same result as the ultralytics NMS on 1,693 frames. I also ran damaged-file tests (truncated mp4, garbage bytes, empty row), which produce error lines and no crash.
+After that I re-scored every speed change on 14 videos. I checked that my batched NMS gives the same result as ultralytics' on 1,693 frames, and I fed in broken files (truncated mp4, garbage bytes, an empty row) to make sure they give error lines and don't crash.
 
 ## 5. Working with AI
 
-The AI suggested CUDA graphs to speed up the forward pass. The first attempt crashed, because the Detect head caches anchors per input shape and the cache was freed. After a fix, I measured it. The outputs were identical, but the speed was the same: 226 against 224 img/s, since the forward pass is already compute-bound at batch 64. The 14-video run got slower, 113 s against 106 s, because capture costs 1.3 s per input shape. I rejected it and reverted. I did not accept the suggestion on trust; the measurement decided.
+The AI suggested CUDA graphs to speed up the forward pass. The first try crashed with an illegal memory access. It turned out the Detect head caches its anchors per input shape, and that cache was getting freed. Once that was fixed the outputs matched, but it wasn't any faster: 226 vs 224 img/s, because at batch 64 the GPU is already busy doing the actual compute. The full 14-video run got slower (113 s vs 106 s), since capturing a graph costs about 1.3 s for every new input shape. I reverted it and went with the measurement.
 
 ## 6. Next steps
 
-First, adaptive sampling: take 2 frames per second and add frames only where they disagree. I estimate 35-40% less GPU work.
-
-Second, a TensorRT FP16 engine built in the prep step on the grader's GPU, with the PyTorch path as a fallback. I expect 1.5-2.5x on inference. I dropped it because of deadline risk: it needs dynamic shapes and a fallback.
-
-Third, cut copies: pass frames between processes through shared memory instead of pickling, and move YUV frames to the GPU and convert there.
+1. **Adaptive sampling.** Start with 2 frames per second and only add more where they disagree. I'd guess that cuts GPU work by 35-40%.
+2. **TensorRT.** Build a TensorRT FP16 engine during the prep step on the grader's GPU, with PyTorch as a fallback. It's probably 1.5-2.5x faster at inference, but it needs dynamic shapes, so I didn't risk it before the deadline.
+3. **Fewer copies.** Pass frames between processes through shared memory instead of pickling them, and do the colour conversion on the GPU.
