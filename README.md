@@ -4,7 +4,13 @@
 
 ## System packages
 
-None. No apt-get commands are needed.
+OpenCV (pulled in by ultralytics) needs `libGL.so.1`. Minimal Ubuntu images may not have it:
+
+```
+sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0
+```
+
+If `python -c "import cv2"` already works, you can skip this.
 
 ## Install
 
